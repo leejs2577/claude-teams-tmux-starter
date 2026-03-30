@@ -1,0 +1,37 @@
+# 작업 결과물 (기본 제외, 필요시 git add -f로 추가)
+workspace/*
+!workspace/.gitkeep
+!workspace/shared/
+workspace/shared/*
+!workspace/shared/.gitkeep
+
+# 로그 파일
+logs/*
+!logs/.gitkeep
+
+# 로컬 설정 (개인 권한 설정)
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 에디터
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 임시 파일
+*.tmp
+*.bak
+
+# Node.js (생성된 프로젝트용)
+node_modules/
+npm-debug.log*
+
+# Python (생성된 프로젝트용)
+__pycache__/
+*.py[cod]
+.venv/

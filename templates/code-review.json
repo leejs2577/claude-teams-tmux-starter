@@ -1,0 +1,51 @@
+{
+  "name": "code-review",
+  "display_name": "코드 리뷰",
+  "description": "보안 / 성능 / 코드 품질 관점에서 병렬로 코드를 리뷰하는 팀",
+  "use_cases": [
+    "PR(Pull Request) 코드 리뷰",
+    "기존 레거시 코드 감사",
+    "보안 취약점 점검",
+    "성능 최적화 분석"
+  ],
+  "members": [
+    {
+      "name": "leader",
+      "display_name": "리뷰 총괄",
+      "agent": "team-leader",
+      "role": "리뷰 결과 수집, 우선순위 정리, 종합 보고서 작성",
+      "window_color": "green"
+    },
+    {
+      "name": "security",
+      "display_name": "보안 리뷰어",
+      "agent": "reviewer",
+      "role": "보안 취약점, 인증/인가, 입력 검증 리뷰",
+      "extra_prompt": "당신은 보안 전문 리뷰어입니다. OWASP Top 10 기준으로 코드를 분석합니다. SQL Injection, XSS, CSRF, 인증/인가 취약점, 민감 정보 노출을 중점적으로 검토하세요. 결과를 workspace/reviewer/security-review.md 에 저장하세요.",
+      "window_color": "red"
+    },
+    {
+      "name": "performance",
+      "display_name": "성능 리뷰어",
+      "agent": "reviewer",
+      "role": "성능 병목, 메모리 누수, 최적화 기회 분석",
+      "extra_prompt": "당신은 성능 최적화 전문 리뷰어입니다. 시간/공간 복잡도, N+1 쿼리, 불필요한 재계산, 메모리 누수, 캐싱 기회를 분석합니다. 결과를 workspace/reviewer/performance-review.md 에 저장하세요.",
+      "window_color": "yellow"
+    },
+    {
+      "name": "quality",
+      "display_name": "코드 품질 리뷰어",
+      "agent": "reviewer",
+      "role": "코드 스타일, 설계 패턴, 유지보수성, 중복 코드 리뷰",
+      "extra_prompt": "당신은 코드 품질 전문 리뷰어입니다. SOLID 원칙, DRY 원칙, 가독성, 중복 코드, 복잡도를 검토합니다. 리팩토링이 필요한 부분을 구체적 예시와 함께 제안하세요. 결과를 workspace/reviewer/quality-review.md 에 저장하세요.",
+      "window_color": "blue"
+    }
+  ],
+  "workflow": [
+    "1. 팀 리더가 리뷰 대상 경로/파일 확인 및 각 리뷰어에게 배분",
+    "2. 보안/성능/품질 리뷰어가 병렬로 코드 분석",
+    "3. 각 리뷰어가 workspace/reviewer/[타입]-review.md 에 결과 저장",
+    "4. 팀 리더가 결과 통합 및 우선순위별 정리",
+    "5. workspace/shared/final-report.md 에 종합 리뷰 보고서 작성"
+  ]
+}

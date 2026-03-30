@@ -1,0 +1,41 @@
+{
+  "name": "custom-example",
+  "display_name": "커스텀 팀 예시",
+  "description": "이 파일을 복사하여 나만의 팀 구성을 만드세요",
+  "use_cases": [
+    "여기에 사용 사례를 작성하세요"
+  ],
+  "_comment": "이 파일을 templates/my-team.json 으로 복사하여 수정하세요. 'agent' 필드는 .claude/agents/ 에 있는 에이전트 이름을 사용합니다.",
+  "members": [
+    {
+      "name": "leader",
+      "display_name": "팀 리더",
+      "agent": "team-leader",
+      "role": "팀 리더 역할 설명",
+      "window_color": "green"
+    },
+    {
+      "name": "member1",
+      "display_name": "팀원 1 이름",
+      "agent": "developer",
+      "role": "팀원 1의 역할 설명",
+      "extra_prompt": "팀원 1의 역할과 행동 방식을 구체적으로 지시하는 프롬프트. 어떤 기술을 사용하는지, 어디에 결과를 저장하는지, 무엇을 중점적으로 하는지 작성하세요.",
+      "window_color": "blue"
+    },
+    {
+      "name": "member2",
+      "display_name": "팀원 2 이름",
+      "agent": "reviewer",
+      "role": "팀원 2의 역할 설명",
+      "extra_prompt": "팀원 2에 대한 추가 지시사항을 여기에 작성하세요.",
+      "window_color": "yellow"
+    }
+  ],
+  "workflow": [
+    "1. 첫 번째 단계",
+    "2. 두 번째 단계 (병렬 실행 가능한 경우 표시)",
+    "3. 세 번째 단계"
+  ],
+  "_available_agents": ["team-leader", "planner", "developer", "reviewer", "qa"],
+  "_available_colors": ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+}

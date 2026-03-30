@@ -1,0 +1,50 @@
+{
+  "name": "web-dev",
+  "display_name": "웹 개발",
+  "description": "프론트엔드 / 백엔드 / QA로 구성된 웹 개발 팀",
+  "use_cases": [
+    "웹 애플리케이션 신규 개발",
+    "기존 웹앱에 새 기능 추가",
+    "API 서버 + 프론트엔드 동시 개발"
+  ],
+  "members": [
+    {
+      "name": "leader",
+      "display_name": "팀 리더",
+      "agent": "team-leader",
+      "role": "전체 프로젝트 관리, 작업 분배, 결과 통합",
+      "window_color": "green"
+    },
+    {
+      "name": "frontend",
+      "display_name": "프론트엔드 개발자",
+      "agent": "developer",
+      "role": "UI/UX 구현, 컴포넌트 개발, 스타일링",
+      "extra_prompt": "당신은 프론트엔드 전문 개발자입니다. React 또는 Vanilla JS로 사용자 인터페이스를 구현합니다. 반응형 디자인, 접근성, 사용자 경험을 중요시합니다. 결과물은 workspace/developer/frontend/ 에 저장하세요.",
+      "window_color": "blue"
+    },
+    {
+      "name": "backend",
+      "display_name": "백엔드 개발자",
+      "agent": "developer",
+      "role": "API 설계 및 구현, 데이터베이스, 서버 로직",
+      "extra_prompt": "당신은 백엔드 전문 개발자입니다. RESTful API와 서버 로직을 구현합니다. 데이터베이스 설계, 인증/인가, 에러 핸들링을 포함합니다. 결과물은 workspace/developer/backend/ 에 저장하세요.",
+      "window_color": "yellow"
+    },
+    {
+      "name": "qa",
+      "display_name": "QA 엔지니어",
+      "agent": "qa",
+      "role": "테스트 케이스 작성, 버그 발견, 품질 보증",
+      "extra_prompt": "당신은 웹 애플리케이션 QA 전문가입니다. 프론트엔드와 백엔드 통합 테스트, API 테스트, UI 테스트를 담당합니다.",
+      "window_color": "cyan"
+    }
+  ],
+  "workflow": [
+    "1. 팀 리더가 요구사항 분석 및 작업 분배",
+    "2. 백엔드 개발자: API 설계 및 구현 (workspace/developer/backend/)",
+    "3. 프론트엔드 개발자: UI 구현 (workspace/developer/frontend/)",
+    "4. QA: 테스트 케이스 작성 및 실행 (workspace/qa/)",
+    "5. 팀 리더: 결과 통합 및 최종 보고"
+  ]
+}
