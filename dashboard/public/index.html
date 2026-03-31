@@ -13,17 +13,14 @@
      ============================================================ -->
 <header class="header">
   <div class="header-brand">
-    <div class="logo">T</div>
-    <h1>Teams Dashboard</h1>
+    <div class="brand-logo">&#129302;</div>
+    <span class="brand-title">Teams Dashboard</span>
   </div>
 
-  <div class="header-divider"></div>
+  <div class="header-sep"></div>
 
   <div class="header-run-info">
-    <span class="run-badge" id="runBadge">
-      <span class="dot"></span>
-      <span id="runBadgeText">대기 중</span>
-    </span>
+    <span class="run-name" id="runName">대기 중</span>
     <span class="run-timestamp" id="runTimestamp"></span>
   </div>
 
@@ -34,9 +31,9 @@
     </div>
   </div>
 
-  <div class="connection-status" id="connectionStatus">
-    <span class="dot"></span>
-    <span id="connectionText">연결 중...</span>
+  <div class="conn-status" id="connStatus">
+    <span class="conn-dot"></span>
+    <span id="connText">연결 중...</span>
   </div>
 </header>
 
@@ -47,35 +44,46 @@
 
   <!-- 에이전트 패널 (왼쪽 70%) -->
   <main class="agents-panel" id="agentsPanel">
-    <!-- 에이전트 없을 때 표시되는 대기 화면 -->
     <div class="empty-state" id="emptyState">
-      <div class="icon">&#9881;</div>
+      <div class="empty-icon">&#9881;</div>
       <h2>team-run.sh 실행 대기 중...</h2>
-      <p>
-        아래 명령어로 팀을 실행하면<br/>
-        에이전트 카드가 실시간으로 나타납니다.
-      </p>
+      <p>아래 명령어로 팀을 실행하면<br/>에이전트 카드가 실시간으로 나타납니다.</p>
       <code>./scripts/team-run.sh web-dev "작업 설명"</code>
     </div>
-
-    <!-- 실행 세션들이 여기에 동적으로 추가됨 -->
     <div id="runsContainer"></div>
   </main>
 
-  <!-- 사이드바: 파일 활동 피드 (오른쪽 30%) -->
-  <aside class="sidebar">
-    <div class="sidebar-header">
-      <span class="sidebar-title">파일 활동</span>
-      <span class="sidebar-count" id="fileCount">0</span>
-    </div>
-    <div class="sidebar-body" id="fileFeed">
-      <div class="feed-empty">파일 활동이 없습니다</div>
-    </div>
-  </aside>
+  <!-- 우측 패널 (30%) -->
+  <aside class="right-panel">
 
+    <!-- 타임라인 -->
+    <div class="panel-section" id="timelinePanel">
+      <div class="panel-header">
+        <span class="panel-title">타임라인</span>
+      </div>
+      <div class="panel-body" id="timelineBody">
+        <div class="timeline-container" id="timelineContainer">
+          <div class="tree-empty">에이전트 실행 전</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 파일 트리 -->
+    <div class="panel-section" id="fileTreePanel">
+      <div class="panel-header">
+        <span class="panel-title">파일 트리</span>
+      </div>
+      <div class="panel-body">
+        <div class="file-tree" id="fileTree">
+          <div class="tree-empty">파일 활동 없음</div>
+        </div>
+      </div>
+    </div>
+
+  </aside>
 </div>
 
-<!-- 토스트 알림 컨테이너 -->
+<!-- 토스트 -->
 <div class="toast-container" id="toastContainer"></div>
 
 <!-- ============================================================
@@ -85,38 +93,85 @@
 'use strict';
 
 // ============================================================
-// 상태 관리
+// 전역 상태
 // ============================================================
 
 /**
- * 클라이언트 측 전체 상태
- * runs: 실행 중인 팀 세션들
- * recentFiles: 최근 파일 활동 목록
+ * 앱 전체 상태 객체
+ * runs: runId -> { template, displayName, timestamp, members }
+ *   members: name -> { displayName, role, status, turn, toolCalls, thinkingPreview, currentAction, startTime }
+ * fileTree: 파일 트리 루트 노드
+ * timelineStart: 타임라인 기준 시각 (ms)
  */
 let appState = {
   runs: {},
-  recentFiles: [],
+  fileTree: { name: 'workspace', type: 'dir', children: {}, depth: 0 },
+  timelineStart: null,
 };
-
-// 현재 표시 중인 가장 최근 runId
-let activeRunId = null;
 
 // SSE 연결 객체
 let eventSource = null;
 
-// 재연결 타이머
+// 재연결 타이머 및 지수 백오프 딜레이
 let reconnectTimer = null;
+let reconnectDelay = 1000;
+const MAX_RECONNECT_DELAY = 30000;
 
-// 로그 자동 스크롤 추적: cardId -> boolean (true면 자동 스크롤 활성)
-const autoScrollMap = new Map();
+// 타임라인 자동 갱신 타이머
+let timelineInterval = null;
+
+// ============================================================
+// DOM 참조
+// ============================================================
+const $emptyState     = document.getElementById('emptyState');
+const $runsContainer  = document.getElementById('runsContainer');
+const $runName        = document.getElementById('runName');
+const $runTimestamp   = document.getElementById('runTimestamp');
+const $headerProgress = document.getElementById('headerProgress');
+const $progressLabel  = document.getElementById('progressLabel');
+const $progressFill   = document.getElementById('progressFill');
+const $connStatus     = document.getElementById('connStatus');
+const $connText       = document.getElementById('connText');
+const $toastContainer = document.getElementById('toastContainer');
+const $timelineContainer = document.getElementById('timelineContainer');
+const $fileTree       = document.getElementById('fileTree');
 
 // ============================================================
 // 유틸리티
 // ============================================================
 
 /**
- * 타임스탬프 문자열(YYYYMMDD-HHMMSS)을 읽기 좋은 형식으로 변환
- * @param {string} ts - 타임스탬프 문자열
+ * HTML 특수문자 이스케이프 (XSS 방지)
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * ISO 시간 문자열을 상대 시간으로 변환
+ * @param {string} isoString
+ * @returns {string}
+ */
+function relativeTime(isoString) {
+  if (!isoString) return '';
+  const diff = (Date.now() - new Date(isoString)) / 1000;
+  if (diff < 5)    return '방금';
+  if (diff < 60)   return `${Math.floor(diff)}초 전`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}분 전`;
+  return `${Math.floor(diff / 3600)}시간 전`;
+}
+
+/**
+ * 타임스탬프 문자열(YYYYMMDD-HHMMSS)을 읽기 좋게 변환
+ * @param {string} ts
  * @returns {string}
  */
 function formatTimestamp(ts) {
@@ -127,85 +182,89 @@ function formatTimestamp(ts) {
 }
 
 /**
- * ISO 시간 문자열을 HH:MM:SS 형식으로 변환
- * @param {string} isoString - ISO 8601 형식 시간 문자열
+ * 도구명을 카테고리로 분류
+ * @param {string} tool
+ * @returns {'read'|'write'|'edit'|'bash'|'other'}
+ */
+function classifyTool(tool) {
+  if (!tool) return 'other';
+  const t = tool.toLowerCase();
+  if (t.includes('read')  || t.includes('glob') || t.includes('grep') || t.includes('get')) return 'read';
+  if (t.includes('write') || t.includes('create'))  return 'write';
+  if (t.includes('edit')  || t.includes('update') || t.includes('patch')) return 'edit';
+  if (t.includes('bash')  || t.includes('exec')   || t.includes('run')  || t.includes('npm') || t.includes('cmd')) return 'bash';
+  return 'other';
+}
+
+/**
+ * 도구 카테고리에 해당하는 이모지 반환
+ * @param {string} tool
  * @returns {string}
  */
-function formatTime(isoString) {
-  const d = new Date(isoString);
-  return d.toLocaleTimeString('ko-KR', { hour12: false });
+function toolIcon(tool) {
+  const cat = classifyTool(tool);
+  const icons = { read: '&#128214;', write: '&#128221;', edit: '&#9999;&#65039;', bash: '&#9889;', other: '&#128296;' };
+  return icons[cat] || icons.other;
 }
 
 /**
- * HTML 특수문자 이스케이프 (XSS 방지)
- * @param {string} str
+ * 파일 확장자에 따른 이모지 반환
+ * @param {string} path
  * @returns {string}
  */
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+function fileIcon(path) {
+  if (!path) return '&#128196;';
+  const ext = path.split('.').pop().toLowerCase();
+  const map = {
+    js: '&#128196;', ts: '&#128196;', jsx: '&#128196;', tsx: '&#128196;',
+    json: '&#128203;',
+    md: '&#128221;',
+    css: '&#127912;', scss: '&#127912;', less: '&#127912;',
+    html: '&#127760;', htm: '&#127760;',
+    py: '&#128013;',
+    sh: '&#128048;',
+    txt: '&#128195;',
+  };
+  return map[ext] || '&#128196;';
 }
 
 /**
- * 가장 최근 runId 반환 (타임스탬프 기준 정렬)
- * @returns {string|null}
- */
-function getLatestRunId() {
-  const ids = Object.keys(appState.runs);
-  if (ids.length === 0) return null;
-  return ids.sort().pop();
-}
-
-/**
- * 에이전트 상태의 한국어 레이블 반환
+ * 상태에 해당하는 한국어 레이블
  * @param {string} status
  * @returns {string}
  */
 function statusLabel(status) {
   const labels = {
-    waiting: '대기중',
-    running: '실행중',
-    done:    '완료',
-    error:   '오류',
+    waiting:    '대기',
+    thinking:   '사고중',
+    using_tool: '도구실행',
+    done:       '완료',
+    error:      '오류',
   };
   return labels[status] || status;
 }
 
-// ============================================================
-// DOM 요소 참조
-// ============================================================
-const $emptyState     = document.getElementById('emptyState');
-const $runsContainer  = document.getElementById('runsContainer');
-const $fileFeed       = document.getElementById('fileFeed');
-const $fileCount      = document.getElementById('fileCount');
-const $runBadge       = document.getElementById('runBadge');
-const $runBadgeText   = document.getElementById('runBadgeText');
-const $runTimestamp   = document.getElementById('runTimestamp');
-const $headerProgress = document.getElementById('headerProgress');
-const $progressLabel  = document.getElementById('progressLabel');
-const $progressFill   = document.getElementById('progressFill');
-const $connectionStatus = document.getElementById('connectionStatus');
-const $connectionText = document.getElementById('connectionText');
-const $toastContainer = document.getElementById('toastContainer');
+/**
+ * 가장 최근 runId 반환
+ * @returns {string|null}
+ */
+function getLatestRunId() {
+  const ids = Object.keys(appState.runs);
+  if (!ids.length) return null;
+  return ids.sort().pop();
+}
 
 // ============================================================
 // 헤더 업데이트
 // ============================================================
 
 /**
- * 헤더의 실행 정보 및 진행률 업데이트
+ * 헤더의 실행 정보 + 진행률 업데이트
  */
 function updateHeader() {
   const runId = getLatestRunId();
-
   if (!runId) {
-    // 실행 없음
-    $runBadge.className = 'run-badge';
-    $runBadgeText.textContent = '대기 중';
+    $runName.textContent = '대기 중';
     $runTimestamp.textContent = '';
     $headerProgress.style.display = 'none';
     return;
@@ -215,73 +274,58 @@ function updateHeader() {
   const members = run.members;
   const names = Object.keys(members);
   const doneCount = names.filter(n => members[n].status === 'done').length;
-  const runningCount = names.filter(n => members[n].status === 'running').length;
 
-  // 배지 상태 업데이트
-  const isActive = doneCount < names.length;
-  $runBadge.className = `run-badge${isActive ? ' active' : ''}`;
-  $runBadgeText.textContent = run.displayName || run.template;
-
-  // 타임스탬프
+  $runName.textContent = run.displayName || run.template;
   $runTimestamp.textContent = formatTimestamp(run.timestamp);
 
-  // 진행률
   $headerProgress.style.display = 'flex';
   const pct = names.length > 0 ? Math.round((doneCount / names.length) * 100) : 0;
-  $progressLabel.textContent = `${doneCount} / ${names.length} 완료`;
+  $progressLabel.textContent = `${doneCount} / ${names.length}`;
   $progressFill.style.width = `${pct}%`;
 }
 
 // ============================================================
-// 에이전트 카드 렌더링
+// 에이전트 카드 생성 / 업데이트
 // ============================================================
 
 /**
  * 새 실행 섹션 DOM 생성
  * @param {string} runId
- * @param {object} run - 실행 데이터
+ * @param {object} run
  */
 function createRunSection(runId, run) {
-  // 대기 화면 숨기기
   $emptyState.style.display = 'none';
 
-  // 섹션 컨테이너
   const section = document.createElement('div');
   section.className = 'run-section';
   section.id = `run-${runId}`;
 
-  // 섹션 헤더
-  const header = document.createElement('div');
-  header.className = 'run-section-header';
-  header.innerHTML = `
+  const hdr = document.createElement('div');
+  hdr.className = 'run-section-header';
+  hdr.innerHTML = `
     <span class="run-section-title">${escapeHtml(run.displayName || run.template)}</span>
-    <span class="run-section-meta">${escapeHtml(formatTimestamp(run.timestamp))}</span>
+    <span class="run-section-time">${escapeHtml(formatTimestamp(run.timestamp))}</span>
   `;
-  section.appendChild(header);
+  section.appendChild(hdr);
 
-  // 카드 그리드
   const grid = document.createElement('div');
   grid.className = 'agents-grid';
   grid.id = `grid-${runId}`;
   section.appendChild(grid);
 
-  // 각 멤버 카드 생성
   for (const [name, member] of Object.entries(run.members)) {
-    const card = createAgentCard(runId, name, member);
-    grid.appendChild(card);
+    grid.appendChild(createAgentCard(runId, name, member));
   }
 
-  // 최신 실행을 맨 위에 추가
   $runsContainer.prepend(section);
-
   updateHeader();
 }
 
 /**
  * 에이전트 카드 DOM 생성
  * @param {string} runId
- * @param {string} name - 에이전트 이름
- * @param {object} member - 멤버 데이터
+ * @param {string} name
+ * @param {object} member
  * @returns {HTMLElement}
  */
 function createAgentCard(runId, name, member) {
@@ -289,322 +333,535 @@ function createAgentCard(runId, name, member) {
   const card = document.createElement('div');
   card.className = 'agent-card';
   card.id = cardId;
-  card.dataset.status = member.status;
-  card.dataset.name = name;
-  card.dataset.runId = runId;
+  card.dataset.status = member.status || 'waiting';
+  card.dataset.runId  = runId;
+  card.dataset.name   = name;
 
   card.innerHTML = `
     <div class="card-header">
-      <span class="status-badge ${member.status}" id="badge-${cardId}">
-        <span class="badge-dot"></span>
-        <span class="badge-label">${statusLabel(member.status)}</span>
-      </span>
+      <span class="status-indicator" id="indicator-${cardId}"></span>
       <div class="card-identity">
         <div class="card-name">${escapeHtml(member.displayName || name)}</div>
         <div class="card-role">${escapeHtml(member.role || '')}</div>
       </div>
-      <div class="file-count" id="filecount-${cardId}">
-        <span>파일</span>
-        <span class="count-num">${member.fileCount || 0}</span>
-      </div>
+      <span class="turn-counter" id="turn-${cardId}">T:0/20</span>
     </div>
-    <div class="card-logs" id="logs-${cardId}">
-      <span class="log-empty">로그 대기 중...</span>
+
+    <div class="card-thinking" id="thinking-${cardId}">
+      <div class="thinking-text" id="thinkingText-${cardId}">...</div>
+    </div>
+
+    <div class="card-activity" id="activity-${cardId}">
+      <div class="activity-empty">대기 중...</div>
     </div>
   `;
-
-  // 로그 영역 스크롤 이벤트: 사용자가 위로 스크롤하면 자동 스크롤 멈춤
-  const logsEl = card.querySelector(`#logs-${cardId}`);
-  autoScrollMap.set(cardId, true);
-
-  logsEl.addEventListener('scroll', () => {
-    const isAtBottom = logsEl.scrollHeight - logsEl.scrollTop <= logsEl.clientHeight + 30;
-    autoScrollMap.set(cardId, isAtBottom);
-  });
-
-  // 기존 로그 출력
-  if (member.logs && member.logs.length > 0) {
-    renderLogs(cardId, member.logs, false);
-  }
 
   return card;
 }
 
 /**
- * 로그 영역에 로그 줄들을 렌더링
- * @param {string} cardId
- * @param {string[]} lines - 렌더링할 로그 줄들
- * @param {boolean} isNew - 새로 추가된 줄인지 여부 (flash 효과용)
- */
-function renderLogs(cardId, lines, isNew = false) {
-  const logsEl = document.getElementById(`logs-${cardId}`);
-  if (!logsEl) return;
-
-  // 처음 로그가 들어오면 빈 메시지 제거
-  const emptyEl = logsEl.querySelector('.log-empty');
-  if (emptyEl) emptyEl.remove();
-
-  // 최근 50줄만 DOM에 유지 (성능 최적화)
-  const existingLines = logsEl.querySelectorAll('.log-line');
-  const MAX_DOM_LINES = 50;
-  const removeCount = Math.max(0, existingLines.length + lines.length - MAX_DOM_LINES);
-  for (let i = 0; i < removeCount; i++) {
-    existingLines[i]?.remove();
-  }
-
-  // 새 줄 추가
-  const fragment = document.createDocumentFragment();
-  for (const line of lines) {
-    const span = document.createElement('span');
-    span.className = `log-line${isNew ? ' new' : ''}`;
-
-    // 에러/경고 키워드 감지로 색상 구분
-    const lower = line.toLowerCase();
-    if (lower.includes('error') || lower.includes('오류') || lower.includes('failed')) {
-      span.classList.add('is-error');
-    } else if (lower.includes('warn') || lower.includes('warning') || lower.includes('경고')) {
-      span.classList.add('is-warn');
-    }
-
-    span.textContent = line;
-    fragment.appendChild(span);
-    fragment.appendChild(document.createTextNode('\n'));
-  }
-  logsEl.appendChild(fragment);
-
-  // 자동 스크롤
-  if (autoScrollMap.get(cardId) !== false) {
-    logsEl.scrollTop = logsEl.scrollHeight;
-  }
-}
-
-/**
- * 에이전트 카드의 상태 업데이트
+ * 카드 상태 업데이트 (data-status, 인디케이터 색상)
  * @param {string} runId
  * @param {string} name
  * @param {string} status
  */
 function updateCardStatus(runId, name, status) {
   const cardId = `card-${runId}-${name}`;
-  const card = document.getElementById(cardId);
+  const card   = document.getElementById(cardId);
   if (!card) return;
 
-  // 카드 data-status 업데이트 (CSS 상단 테두리 변경)
   card.dataset.status = status;
 
-  // 배지 업데이트
-  const badge = document.getElementById(`badge-${cardId}`);
-  if (badge) {
-    badge.className = `status-badge ${status}`;
-    const labelEl = badge.querySelector('.badge-label');
-    if (labelEl) labelEl.textContent = statusLabel(status);
-  }
-
-  // 완료 배너 추가
-  if (status === 'done') {
-    const logsEl = document.getElementById(`logs-${cardId}`);
-    if (logsEl && !card.querySelector('.card-done-banner')) {
-      const banner = document.createElement('div');
-      banner.className = 'card-done-banner';
-      banner.innerHTML = `
-        <span>&#10003;</span>
-        <span>작업 완료</span>
-      `;
-      card.appendChild(banner);
-    }
-  }
-}
-
-/**
- * 파일 카운터 업데이트
- * @param {string} runId
- * @param {string} name
- * @param {number} count
- */
-function updateFileCount(runId, name, count) {
-  const cardId = `card-${runId}-${name}`;
-  const el = document.getElementById(`filecount-${cardId}`);
-  if (!el) return;
-  const numEl = el.querySelector('.count-num');
-  if (numEl) numEl.textContent = count;
-}
-
-// ============================================================
-// 파일 피드 렌더링
-// ============================================================
-
-/**
- * 파일 활동 피드에 항목 추가
- * @param {object} fileEntry - { path, type, time, memberName }
- * @param {boolean} prepend - 맨 위에 추가할지 여부
- */
-function addFileToFeed(fileEntry, prepend = true) {
-  // 빈 상태 메시지 제거
-  const emptyEl = $fileFeed.querySelector('.feed-empty');
-  if (emptyEl) emptyEl.remove();
-
-  const item = document.createElement('div');
-  item.className = `file-item member-${escapeHtml(fileEntry.memberName || 'shared')}`;
-
-  const typeLabel = fileEntry.type === 'add' ? 'NEW' : 'MOD';
-  const timeStr = fileEntry.time ? formatTime(fileEntry.time) : '';
-
-  item.innerHTML = `
-    <div class="file-type-icon ${escapeHtml(fileEntry.type)}">${typeLabel}</div>
-    <div class="file-info">
-      <span class="file-path" title="${escapeHtml(fileEntry.path)}">${escapeHtml(fileEntry.path)}</span>
-      <div class="file-meta">
-        <span class="file-member">${escapeHtml(fileEntry.memberName || 'shared')}</span>
-        <span class="file-time">${escapeHtml(timeStr)}</span>
-      </div>
-    </div>
-  `;
-
-  if (prepend) {
-    $fileFeed.prepend(item);
-  } else {
-    $fileFeed.appendChild(item);
-  }
-
-  // 최대 30개 유지
-  const items = $fileFeed.querySelectorAll('.file-item');
-  if (items.length > 30) {
-    items[items.length - 1].remove();
-  }
-
-  // 카운터 업데이트
-  $fileCount.textContent = $fileFeed.querySelectorAll('.file-item').length;
-}
-
-// ============================================================
-// 토스트 알림
-// ============================================================
-
-/**
- * 토스트 알림 표시
- * @param {string} message - 알림 메시지
- * @param {string} type - 알림 타입 ('done' | 'error' | 'info')
- * @param {number} duration - 표시 시간 (ms)
- */
-function showToast(message, type = 'info', duration = 4000) {
-  const icons = { done: '&#10003;', error: '&#10007;', info: 'i' };
-
-  const toast = document.createElement('div');
-  toast.className = `toast ${type}`;
-  toast.innerHTML = `
-    <span class="toast-icon">${icons[type] || 'i'}</span>
-    <span>${escapeHtml(message)}</span>
-  `;
-
-  $toastContainer.appendChild(toast);
-
-  setTimeout(() => {
-    toast.classList.add('fade-out');
-    setTimeout(() => toast.remove(), 300);
-  }, duration);
-}
-
-// ============================================================
-// 전체 상태에서 UI 초기화
-// ============================================================
-
-/**
- * 서버로부터 받은 전체 상태로 UI를 초기화
- * @param {object} serverState - 서버 상태 스냅샷
- */
-function initializeFromState(serverState) {
-  appState = serverState;
-
-  // 실행 섹션 생성 (시간 순 정렬, 오래된 것 먼저)
-  const runIds = Object.keys(appState.runs).sort();
-
-  if (runIds.length === 0) {
-    $emptyState.style.display = 'flex';
-  } else {
-    $emptyState.style.display = 'none';
-    for (const runId of runIds) {
-      if (!document.getElementById(`run-${runId}`)) {
-        createRunSection(runId, appState.runs[runId]);
-      }
-    }
-    activeRunId = getLatestRunId();
-  }
-
-  // 파일 피드 초기화 (최신 순으로 표시)
-  if (appState.recentFiles && appState.recentFiles.length > 0) {
-    $fileFeed.innerHTML = '';
-    // recentFiles는 이미 최신 순이므로 append
-    for (const fileEntry of appState.recentFiles) {
-      addFileToFeed(fileEntry, false);
-    }
+  // 완료 시 배너 추가
+  if (status === 'done' && !card.querySelector('.card-done-banner')) {
+    const member = appState.runs[runId]?.members[name];
+    const lastAction = member?.currentAction || '';
+    const banner = document.createElement('div');
+    banner.className = 'card-done-banner';
+    banner.innerHTML = `<span>&#10003;</span><span class="done-summary">${escapeHtml(lastAction || '작업 완료')}</span>`;
+    card.appendChild(banner);
   }
 
   updateHeader();
 }
 
+/**
+ * 사고 미리보기 영역 업데이트
+ * @param {string} runId
+ * @param {string} name
+ * @param {string} text  - 표시할 텍스트
+ * @param {boolean} isTool - 도구 호출 요약인지 여부
+ */
+function updateThinkingPreview(runId, name, text, isTool) {
+  const cardId = `card-${runId}-${name}`;
+  const el = document.getElementById(`thinkingText-${cardId}`);
+  if (!el) return;
+
+  // 최대 120자 자르기
+  const preview = String(text || '').slice(0, 120);
+  const prefix  = isTool ? '' : '&#128173; ';
+  el.innerHTML  = prefix + escapeHtml(preview);
+
+  if (isTool) {
+    el.classList.add('is-tool');
+  } else {
+    el.classList.remove('is-tool');
+  }
+}
+
+/**
+ * Turn 카운터 업데이트
+ * @param {string} runId
+ * @param {string} name
+ * @param {number} turn
+ */
+function updateTurnCounter(runId, name, turn) {
+  const cardId = `card-${runId}-${name}`;
+  const el = document.getElementById(`turn-${cardId}`);
+  if (!el) return;
+  el.textContent = `T:${turn}/20`;
+}
+
+/**
+ * Activity Feed에 도구 호출 항목 추가
+ * @param {string} runId
+ * @param {string} name
+ * @param {object} toolCall - { tool, summary, timestamp }
+ */
+function addActivityItem(runId, name, toolCall) {
+  const cardId = `card-${runId}-${name}`;
+  const container = document.getElementById(`activity-${cardId}`);
+  if (!container) return;
+
+  // 빈 메시지 제거
+  const empty = container.querySelector('.activity-empty');
+  if (empty) empty.remove();
+
+  // 새 항목 생성
+  const item = document.createElement('div');
+  item.className = 'activity-item';
+
+  const cat  = classifyTool(toolCall.tool);
+  const icon = toolIcon(toolCall.tool);
+  const time = relativeTime(toolCall.timestamp);
+
+  item.innerHTML = `
+    <span class="tool-badge ${escapeHtml(cat)}">${escapeHtml(toolCall.tool ? toolCall.tool.slice(0, 5) : 'tool')}</span>
+    <div class="activity-content">
+      <div class="activity-summary">${icon}&nbsp;${escapeHtml(toolCall.summary || toolCall.tool)}</div>
+      <div class="activity-time" data-ts="${escapeHtml(toolCall.timestamp || '')}">${escapeHtml(time)}</div>
+    </div>
+  `;
+
+  // 맨 위에 추가 (slide-in 애니메이션은 CSS에서)
+  container.insertBefore(item, container.firstChild);
+
+  // 최대 8개 유지
+  const items = container.querySelectorAll('.activity-item');
+  if (items.length > 8) {
+    items[items.length - 1].remove();
+  }
+}
+
 // ============================================================
-// SSE 이벤트 처리
+// 타임라인
 // ============================================================
 
 /**
- * 각 SSE 이벤트 타입별 처리 함수 매핑
+ * 타임라인 전체 재렌더링
+ * 매 초마다 setInterval로 호출됨
  */
+function renderTimeline() {
+  const runId = getLatestRunId();
+  if (!runId) return;
+
+  const run   = appState.runs[runId];
+  const names = Object.keys(run.members);
+  if (!names.length) return;
+
+  const now = Date.now();
+
+  // 전체 기준 시간: 가장 먼저 시작한 에이전트 기준
+  let earliest = Infinity;
+  for (const name of names) {
+    const m = run.members[name];
+    if (m.startTime) {
+      const t = new Date(m.startTime).getTime();
+      if (t < earliest) earliest = t;
+    }
+  }
+  if (earliest === Infinity) earliest = now;
+
+  const totalMs = Math.max(now - earliest, 1000);
+
+  // 컨테이너 초기화
+  $timelineContainer.innerHTML = '';
+
+  for (const name of names) {
+    const member = run.members[name];
+    const memberStart = member.startTime
+      ? new Date(member.startTime).getTime()
+      : (member.status !== 'waiting' ? earliest : null);
+
+    const row = document.createElement('div');
+    row.className = 'timeline-row';
+
+    const label = document.createElement('div');
+    label.className = 'timeline-name';
+    label.textContent = (member.displayName || name).slice(0, 7);
+
+    const track = document.createElement('div');
+    track.className = 'timeline-track';
+
+    const bar = document.createElement('div');
+    bar.className = `timeline-bar status-${member.status || 'waiting'}`;
+
+    if (memberStart) {
+      // 막대 너비 = (경과 시간 / 전체 시간) × 100%
+      const elapsed = Math.max(now - memberStart, 0);
+      const pct = Math.min((elapsed / totalMs) * 100, 100);
+      bar.style.width = `${pct}%`;
+    } else {
+      bar.style.width = '0%';
+    }
+
+    track.appendChild(bar);
+
+    // 도구 호출 점 추가
+    const toolCalls = member.toolCalls || [];
+    for (const tc of toolCalls) {
+      if (!tc.timestamp || !memberStart) continue;
+      const tcTime = new Date(tc.timestamp).getTime();
+      const tcPct  = Math.min(((tcTime - earliest) / totalMs) * 100, 100);
+      if (tcPct < 0 || tcPct > 100) continue;
+
+      const dot = document.createElement('div');
+      dot.className = 'timeline-dot';
+      dot.style.left = `${tcPct}%`;
+      dot.title = tc.tool || '';
+      track.appendChild(dot);
+    }
+
+    row.appendChild(label);
+    row.appendChild(track);
+    $timelineContainer.appendChild(row);
+  }
+}
+
+/**
+ * 타임라인 자동 갱신 시작
+ */
+function startTimelineInterval() {
+  if (timelineInterval) return;
+  timelineInterval = setInterval(renderTimeline, 1000);
+}
+
+// ============================================================
+// 파일 트리
+// ============================================================
+
+/**
+ * 경로를 트리 구조에 추가
+ * @param {object} tree  - 루트 노드
+ * @param {string} relativePath - 'developer/src/server.js' 형태
+ * @param {string} changeType   - 'add' | 'change'
+ */
+function addPathToTree(tree, relativePath, changeType) {
+  const parts = relativePath.replace(/\\/g, '/').split('/').filter(Boolean);
+  let node = tree;
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const isLast = i === parts.length - 1;
+
+    if (!node.children) node.children = {};
+
+    if (!node.children[part]) {
+      node.children[part] = {
+        name:    part,
+        type:    isLast ? 'file' : 'dir',
+        depth:   i + 1,
+        children: isLast ? null : {},
+        isNew:   false,
+        lastChanged: null,
+      };
+    }
+
+    const child = node.children[part];
+
+    if (isLast) {
+      child.type = 'file';
+      child.lastChanged = Date.now();
+      if (changeType === 'add') {
+        child.isNew = true;
+        // 3초 후 isNew 해제
+        setTimeout(() => {
+          child.isNew = false;
+          renderFileTree();
+        }, 3000);
+      } else {
+        child.isChanged = true;
+        // 2초 후 isChanged 해제
+        setTimeout(() => {
+          child.isChanged = false;
+          renderFileTree();
+        }, 2000);
+      }
+    }
+
+    node = child;
+  }
+}
+
+/**
+ * 트리 노드를 HTML 요소로 재귀 렌더링
+ * @param {object} node
+ * @returns {DocumentFragment}
+ */
+function renderTreeNode(node) {
+  const frag = document.createDocumentFragment();
+
+  if (!node.children) return frag;
+
+  // 디렉토리 → 파일 순, 알파벳 순 정렬
+  const sortedKeys = Object.keys(node.children).sort((a, b) => {
+    const ca = node.children[a];
+    const cb = node.children[b];
+    if (ca.type !== cb.type) return ca.type === 'dir' ? -1 : 1;
+    return a.localeCompare(b);
+  });
+
+  for (const key of sortedKeys) {
+    const child = node.children[key];
+    const el    = document.createElement('div');
+    el.className = 'tree-node';
+
+    // 인덴트
+    const depth = child.depth || 1;
+    let indentHtml = '';
+    for (let i = 1; i < depth; i++) {
+      indentHtml += '<span class="tree-indent"></span>';
+    }
+
+    // 상태 뱃지
+    let badge = '';
+    if (child.isNew)     { el.classList.add('is-new');     badge = '<span class="tree-badge">&#10024;</span>'; }
+    if (child.isChanged) { el.classList.add('is-changed'); badge = '<span class="tree-badge">&#128260;</span>'; }
+
+    if (child.type === 'dir') {
+      el.classList.add('is-dir');
+      el.innerHTML = `${indentHtml}<span class="tree-icon">&#128193;</span><span class="tree-label">${escapeHtml(child.name)}/</span>${badge}`;
+    } else {
+      const icon = fileIcon(child.name);
+      el.innerHTML = `${indentHtml}<span class="tree-icon">${icon}</span><span class="tree-label">${escapeHtml(child.name)}</span>${badge}`;
+    }
+
+    frag.appendChild(el);
+
+    // 재귀: 하위 노드 렌더링
+    if (child.type === 'dir' && child.children) {
+      frag.appendChild(renderTreeNode(child));
+    }
+  }
+
+  return frag;
+}
+
+/**
+ * 파일 트리 전체 재렌더링
+ */
+function renderFileTree() {
+  $fileTree.innerHTML = '';
+
+  const hasChildren = appState.fileTree.children &&
+    Object.keys(appState.fileTree.children).length > 0;
+
+  if (!hasChildren) {
+    const empty = document.createElement('div');
+    empty.className = 'tree-empty';
+    empty.textContent = '파일 활동 없음';
+    $fileTree.appendChild(empty);
+    return;
+  }
+
+  // 루트 'workspace/' 노드 표시
+  const rootEl = document.createElement('div');
+  rootEl.className = 'tree-node is-dir';
+  rootEl.innerHTML = `<span class="tree-icon">&#128194;</span><span class="tree-label">workspace/</span>`;
+  $fileTree.appendChild(rootEl);
+
+  $fileTree.appendChild(renderTreeNode(appState.fileTree));
+}
+
+// ============================================================
+// 상대 시간 갱신 (activity feed)
+// ============================================================
+
+/**
+ * 모든 activity-time 요소의 표시 텍스트를 현재 시각 기준으로 갱신
+ */
+function refreshRelativeTimes() {
+  const els = document.querySelectorAll('.activity-time[data-ts]');
+  for (const el of els) {
+    const ts = el.dataset.ts;
+    if (ts) el.textContent = relativeTime(ts);
+  }
+}
+
+// ============================================================
+// SSE 이벤트 핸들러
+// ============================================================
+
 const eventHandlers = {
 
   /**
    * 전체 상태 스냅샷 (연결 직후 수신)
    */
   'state': (data) => {
-    initializeFromState(data);
+    // runs 병합
+    appState.runs = data.runs || {};
+
+    // 기존 멤버에 클라이언트 전용 필드 초기화
+    for (const runId of Object.keys(appState.runs)) {
+      const run = appState.runs[runId];
+      for (const name of Object.keys(run.members)) {
+        const m = run.members[name];
+        m.toolCalls       = m.toolCalls       || [];
+        m.thinkingPreview = m.thinkingPreview || '';
+        m.currentAction   = m.currentAction   || '';
+        m.startTime       = m.startTime       || null;
+      }
+    }
+
+    // 파일 트리 재구성 (recentFiles 기반)
+    appState.fileTree = { name: 'workspace', type: 'dir', children: {}, depth: 0 };
+    if (data.recentFiles && data.recentFiles.length > 0) {
+      // 오래된 것부터 추가해야 isNew/isChanged 타이머가 의미 있음 - 여기선 상태 복원이므로 단순 추가
+      for (const f of [...data.recentFiles].reverse()) {
+        addPathToTree(appState.fileTree, f.path, f.type);
+      }
+    }
+
+    // 기존 DOM 정리 후 재구성
+    $runsContainer.innerHTML = '';
+    const runIds = Object.keys(appState.runs).sort();
+    if (!runIds.length) {
+      $emptyState.style.display = 'flex';
+    } else {
+      $emptyState.style.display = 'none';
+      for (const runId of runIds) {
+        createRunSection(runId, appState.runs[runId]);
+      }
+    }
+
+    renderFileTree();
+    renderTimeline();
+    startTimelineInterval();
+    updateHeader();
   },
 
   /**
-   * 새 실행 세션 시작
+   * 새 실행 시작
    */
   'run:start': (data) => {
     const { runId, template, displayName, timestamp, members } = data;
 
-    // 상태에 등록
-    appState.runs[runId] = { template, displayName, timestamp, members };
-    activeRunId = runId;
+    // 멤버 초기화 (클라이언트 전용 필드 포함)
+    const initMembers = {};
+    for (const [name, m] of Object.entries(members || {})) {
+      initMembers[name] = {
+        ...m,
+        toolCalls:       [],
+        thinkingPreview: '',
+        currentAction:   '',
+        startTime:       null,
+      };
+    }
 
-    // DOM 생성
-    createRunSection(runId, appState.runs[runId]);
+    appState.runs[runId] = { template, displayName, timestamp, members: initMembers };
+
+    if (!document.getElementById(`run-${runId}`)) {
+      createRunSection(runId, appState.runs[runId]);
+    }
+
     updateHeader();
-
-    showToast(`새 실행 시작: ${displayName || template}`, 'info');
+    showToast(`새 실행 시작: ${escapeHtml(displayName || template)}`, 'info');
+    startTimelineInterval();
   },
 
   /**
    * 에이전트 상태 변경
    */
   'agent:status': (data) => {
-    const { runId, name, status } = data;
+    const { runId, name, status, turn } = data;
     const run = appState.runs[runId];
-    if (run?.members[name]) {
-      run.members[name].status = status;
+    if (!run?.members[name]) return;
+
+    const member = run.members[name];
+    member.status = status;
+
+    // 처음 thinking/using_tool 진입 시 startTime 기록
+    if (!member.startTime && (status === 'thinking' || status === 'using_tool')) {
+      member.startTime = new Date().toISOString();
     }
+
+    if (turn !== undefined) {
+      member.turn = turn;
+      updateTurnCounter(runId, name, turn);
+    }
+
     updateCardStatus(runId, name, status);
-    updateHeader();
   },
 
   /**
-   * 에이전트 로그 줄 추가
+   * 에이전트 도구 호출
    */
-  'agent:log': (data) => {
-    const { runId, name, line } = data;
-    const cardId = `card-${runId}-${name}`;
-
-    // 상태 로그 배열 업데이트
+  'agent:tool_call': (data) => {
+    const { runId, name, tool, summary, timestamp } = data;
     const run = appState.runs[runId];
-    if (run?.members[name]) {
-      const logs = run.members[name].logs;
-      logs.push(line);
-      if (logs.length > 100) logs.shift();
+    if (!run?.members[name]) return;
+
+    const member = run.members[name];
+
+    // 상태를 'using_tool'로 변경
+    member.status = 'using_tool';
+    if (!member.startTime) {
+      member.startTime = timestamp || new Date().toISOString();
+    }
+    member.currentAction = summary || tool;
+
+    // toolCalls 배열 앞에 추가, 최대 20개 유지
+    member.toolCalls = member.toolCalls || [];
+    member.toolCalls.unshift({ tool, summary, timestamp: timestamp || new Date().toISOString() });
+    if (member.toolCalls.length > 20) member.toolCalls.pop();
+
+    // 카드 업데이트
+    updateCardStatus(runId, name, 'using_tool');
+    updateThinkingPreview(runId, name, summary || tool, true);
+    addActivityItem(runId, name, { tool, summary, timestamp: timestamp || new Date().toISOString() });
+  },
+
+  /**
+   * 에이전트 사고 미리보기
+   */
+  'agent:thinking': (data) => {
+    const { runId, name, text } = data;
+    const run = appState.runs[runId];
+    if (!run?.members[name]) return;
+
+    const member = run.members[name];
+
+    // using_tool 상태일 때는 덮어쓰지 않음
+    if (member.status !== 'using_tool') {
+      member.status = 'thinking';
+      if (!member.startTime) {
+        member.startTime = new Date().toISOString();
+      }
+      updateCardStatus(runId, name, 'thinking');
     }
 
-    // DOM 업데이트
-    renderLogs(cardId, [line], true);
+    member.thinkingPreview = (text || '').slice(0, 120);
+    updateThinkingPreview(runId, name, member.thinkingPreview, false);
   },
 
   /**
@@ -614,76 +871,84 @@ const eventHandlers = {
     const { runId, name } = data;
     const run = appState.runs[runId];
     const member = run?.members[name];
+    if (!member) return;
 
-    if (member) {
-      const displayName = member.displayName || name;
-      showToast(`${displayName} 완료`, 'done');
-    }
-
+    member.status = 'done';
+    updateCardStatus(runId, name, 'done');
     updateHeader();
+
+    const displayName = member.displayName || name;
+    showToast(`${escapeHtml(displayName)} 완료`, 'done');
   },
 
   /**
-   * 파일 생성/변경 이벤트
+   * 파일 생성 / 변경
    */
   'file:change': (data) => {
     const { runId, memberName, path, type } = data;
 
-    // 파일 카운터 업데이트
-    const run = appState.runs[runId];
-    if (run?.members[memberName]) {
-      run.members[memberName].fileCount++;
-      updateFileCount(runId, memberName, run.members[memberName].fileCount);
-    }
-
-    // 피드에 추가
-    const fileEntry = {
-      path,
-      type,
-      time: new Date().toISOString(),
-      memberName,
-    };
-    appState.recentFiles.unshift(fileEntry);
-    if (appState.recentFiles.length > 30) appState.recentFiles.pop();
-
-    addFileToFeed(fileEntry, true);
+    // 파일 트리 업데이트
+    addPathToTree(appState.fileTree, path, type);
+    renderFileTree();
   },
 };
 
 // ============================================================
-// SSE 연결 관리
+// 토스트 알림
 // ============================================================
 
 /**
- * SSE 연결 상태 표시 업데이트
+ * 토스트 알림 표시
+ * @param {string} message
+ * @param {'info'|'done'|'error'} type
+ * @param {number} duration ms
+ */
+function showToast(message, type = 'info', duration = 3500) {
+  const icons = { done: '&#10003;', error: '&#10007;', info: '&#9432;' };
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.innerHTML = `<span class="toast-icon">${icons[type] || icons.info}</span><span class="toast-msg">${escapeHtml(message)}</span>`;
+  $toastContainer.appendChild(toast);
+
+  setTimeout(() => {
+    toast.classList.add('fade-out');
+    setTimeout(() => toast.remove(), 280);
+  }, duration);
+}
+
+// ============================================================
+// 연결 상태 표시
+// ============================================================
+
+/**
+ * 연결 상태 UI 업데이트
  * @param {'connecting'|'connected'|'reconnecting'} status
  */
-function setConnectionStatus(status) {
-  $connectionStatus.className = `connection-status ${status === 'connected' ? 'connected' : status === 'reconnecting' ? 'reconnecting' : ''}`;
-  const labels = {
-    connecting:   '연결 중...',
-    connected:    '연결됨',
-    reconnecting: '재연결 중...',
-  };
-  $connectionText.textContent = labels[status] || status;
+function setConnStatus(status) {
+  $connStatus.className = `conn-status${status === 'connected' ? ' connected' : status === 'reconnecting' ? ' reconnecting' : ''}`;
+  const labels = { connecting: '연결 중...', connected: '연결됨', reconnecting: '재연결 중...' };
+  $connText.textContent = labels[status] || status;
 }
+
+// ============================================================
+// SSE 연결 관리 (지수 백오프 재연결)
+// ============================================================
 
 /**
  * SSE 연결 시작
  */
 function connectSSE() {
-  // 기존 연결 정리
   if (eventSource) {
     eventSource.close();
     eventSource = null;
   }
 
-  setConnectionStatus('connecting');
+  setConnStatus('connecting');
   eventSource = new EventSource('/events');
 
-  // 연결 성공
   eventSource.addEventListener('open', () => {
-    setConnectionStatus('connected');
+    setConnStatus('connected');
+    reconnectDelay = 1000; // 성공 시 딜레이 초기화
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
@@ -691,7 +956,7 @@ function connectSSE() {
     console.log('[대시보드] SSE 연결 성공');
   });
 
-  // 각 이벤트 타입에 대한 리스너 등록
+  // 각 이벤트 타입별 리스너 등록
   for (const [eventType, handler] of Object.entries(eventHandlers)) {
     eventSource.addEventListener(eventType, (e) => {
       try {
@@ -703,10 +968,10 @@ function connectSSE() {
     });
   }
 
-  // 연결 오류 시 자동 재연결
-  eventSource.addEventListener('error', (e) => {
-    console.warn('[대시보드] SSE 연결 오류, 3초 후 재연결...');
-    setConnectionStatus('reconnecting');
+  // 연결 오류: 지수 백오프로 재연결
+  eventSource.addEventListener('error', () => {
+    console.warn(`[대시보드] SSE 오류, ${reconnectDelay / 1000}초 후 재연결...`);
+    setConnStatus('reconnecting');
     eventSource.close();
     eventSource = null;
 
@@ -714,24 +979,35 @@ function connectSSE() {
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         connectSSE();
-      }, 3000);
+      }, reconnectDelay);
+
+      // 지수 백오프: 1s → 2s → 4s → ... → 30s
+      reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
     }
   });
 }
+
+// ============================================================
+// 주기적 갱신
+// ============================================================
+
+/**
+ * 1분마다 activity 상대 시간 텍스트 갱신
+ */
+setInterval(refreshRelativeTimes, 10000);
 
 // ============================================================
 // 초기화
 // ============================================================
 
 /**
- * 앱 초기화: SSE 연결 시작
+ * 앱 초기화
  */
 function init() {
-  console.log('[대시보드] 초기화 시작');
+  console.log('[대시보드] 초기화');
   connectSSE();
 }
 
-// DOM 로드 완료 후 초기화
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', init);
 } else {

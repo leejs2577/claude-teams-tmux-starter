@@ -1,6 +1,11 @@
 /**
  * Claude Code Teams 실시간 모니터링 대시보드 서버
  * Node.js + Express + SSE (Server-Sent Events) 기반
+ *
+ * stream-json JSONL 형식 지원:
+ * - .json 파일을 position tracking으로 새 줄 읽기
+ * - content_block_start/delta/stop 이벤트 파싱
+ * - type:result 줄로 완료 처리
  */
 
 import express from 'express';
@@ -53,8 +58,16 @@ const state = {
 const clients = new Set();
 
 // 파일 읽기 위치 추적 (position tracking)
-// key: 파일 경로, value: 마지막으로 읽은 바이트 수
+// key: 파일 경로, value: 마지막으로 읽은 문자 수 (문자열 기준)
 const filePositions = new Map();
+
+// JSONL 파싱 상태 추적
+// key: 파일 경로, value: { pendingLine: string }
+const jsonlStates = new Map();
+
+// 에이전트별 블록 처리 상태
+// key: "runId/memberName", value: AgentParseState
+const agentParseStates = new Map();
 
 // ============================================================
 // SSE 유틸리티
@@ -145,17 +158,11 @@ async function initRun(runDir) {
   const templateData = loadTemplate(template);
   const displayName = templateData?.display_name || template;
 
-  // 멤버 목록 구성
+  // 멤버 목록 구성 (확장된 agent state 구조)
   const members = {};
   if (templateData?.members) {
     for (const member of templateData.members) {
-      members[member.name] = {
-        displayName: member.display_name,
-        role: member.role,
-        status: 'waiting',
-        logs: [],
-        fileCount: 0,
-      };
+      members[member.name] = createMemberState(member.display_name, member.role);
     }
   }
 
@@ -183,16 +190,305 @@ async function initRun(runDir) {
   }
 }
 
+/**
+ * 에이전트 초기 상태 객체 생성
+ * @param {string} displayName - 표시 이름
+ * @param {string} role - 역할
+ * @returns {object} 에이전트 상태 객체
+ */
+function createMemberState(displayName, role) {
+  return {
+    displayName,
+    role,
+    status: 'waiting',         // waiting | thinking | using_tool | done | error
+    currentAction: '',          // "📝 server.js 생성 중..." 형태
+    toolCalls: [],              // 최근 20개: {tool, summary, timestamp}
+    thinkingBuffer: '',         // 현재 축적 중인 사고 텍스트
+    thinkingPreview: '',        // 최근 완성된 사고 텍스트 (최대 100자)
+    turn: 0,
+    fileCount: 0,
+    startTime: null,            // ISO 타임스탬프
+    endTime: null,
+    totalCost: 0,
+  };
+}
+
 // ============================================================
-// 로그 파일 처리 (증가분만 읽기)
+// tool 호출 친화적 메시지 생성
 // ============================================================
 
 /**
- * txt 로그 파일에서 새로 추가된 내용만 읽어 SSE 전송
- * position tracking으로 이미 읽은 부분은 건너뜀
- * @param {string} filePath - 로그 파일 경로
+ * tool_use content_block 의 input JSON을 받아 사람이 읽기 좋은 메시지 생성
+ * @param {string} toolName - 도구 이름
+ * @param {object} input - 도구 입력 JSON
+ * @returns {string} 친화적 메시지
  */
-async function processLogFile(filePath) {
+function formatToolCall(toolName, input) {
+  try {
+    switch (toolName) {
+      case 'Write': {
+        const fileName = input?.file_path ? input.file_path.split('/').pop() : '?';
+        return `📝 ${fileName} 생성`;
+      }
+      case 'Edit': {
+        const fileName = input?.file_path ? input.file_path.split('/').pop() : '?';
+        return `✏️ ${fileName} 수정`;
+      }
+      case 'Read': {
+        const fileName = input?.file_path ? input.file_path.split('/').pop() : '?';
+        return `📖 ${fileName} 읽기`;
+      }
+      case 'Bash': {
+        const cmd = (input?.command || '').slice(0, 60);
+        return `⚡ ${cmd}`;
+      }
+      default:
+        return `🔧 ${toolName}`;
+    }
+  } catch {
+    return `🔧 ${toolName}`;
+  }
+}
+
+// ============================================================
+// JSONL 스트림 이벤트 처리 (stream-json 형식)
+// ============================================================
+
+/**
+ * 에이전트의 JSONL 파싱 상태를 가져오거나 초기화
+ * @param {string} key - "runId/memberName"
+ * @returns {object} 파싱 상태
+ */
+function getAgentParseState(key) {
+  if (!agentParseStates.has(key)) {
+    agentParseStates.set(key, {
+      // index별 블록 정보: { type: 'text'|'tool_use', name: string, partialJson: string }
+      blocks: new Map(),
+    });
+  }
+  return agentParseStates.get(key);
+}
+
+/**
+ * stream-json JSONL 이벤트 한 줄 처리
+ * @param {object} parsed - 파싱된 JSON 객체
+ * @param {string} runId - 실행 ID
+ * @param {string} memberName - 에이전트 이름
+ */
+function handleStreamEvent(parsed, runId, memberName) {
+  const run = state.runs[runId];
+  if (!run) return;
+
+  const member = run.members[memberName];
+  if (!member) return;
+
+  const stateKey = `${runId}/${memberName}`;
+
+  // ── type: result → 완료 처리 ──────────────────────────────
+  if (parsed.type === 'result') {
+    const isError = parsed.is_error === true;
+    member.status = isError ? 'error' : 'done';
+    member.endTime = new Date().toISOString();
+    member.totalCost = parsed.total_cost_usd || 0;
+    member.currentAction = isError ? '오류 발생' : '완료';
+
+    broadcast('agent:status', {
+      runId,
+      name: memberName,
+      status: member.status,
+      turn: member.turn,
+    });
+    broadcast('agent:done', {
+      runId,
+      name: memberName,
+      isError,
+      totalCost: member.totalCost,
+      durationMs: parsed.duration_ms,
+    });
+
+    console.log(`[정보] 에이전트 ${isError ? '오류' : '완료'}: ${runId} / ${memberName} (비용: $${member.totalCost})`);
+    return;
+  }
+
+  // ── type: stream_event 처리 ───────────────────────────────
+  if (parsed.type !== 'stream_event') return;
+
+  const evt = parsed.event;
+  if (!evt) return;
+
+  const parseState = getAgentParseState(stateKey);
+
+  switch (evt.type) {
+    // 블록 시작
+    case 'content_block_start': {
+      const idx = evt.index;
+      const block = evt.content_block;
+      if (!block) break;
+
+      if (block.type === 'text') {
+        // 텍스트 블록 시작: thinking 상태로 전환
+        parseState.blocks.set(idx, { type: 'text', partialText: '' });
+
+        if (member.status !== 'thinking') {
+          member.status = 'thinking';
+          member.thinkingBuffer = '';
+          broadcast('agent:status', {
+            runId,
+            name: memberName,
+            status: 'thinking',
+            turn: member.turn,
+          });
+        }
+        // startTime 최초 설정
+        if (!member.startTime) {
+          member.startTime = new Date().toISOString();
+        }
+
+      } else if (block.type === 'tool_use') {
+        // tool_use 블록 시작: tool 사용 상태로 전환
+        parseState.blocks.set(idx, {
+          type: 'tool_use',
+          name: block.name || '',
+          partialJson: '',
+        });
+
+        member.status = 'using_tool';
+        member.currentAction = `🔧 ${block.name || ''}`;
+        broadcast('agent:status', {
+          runId,
+          name: memberName,
+          status: 'using_tool',
+          turn: member.turn,
+        });
+      }
+      break;
+    }
+
+    // 블록 델타 (내용 추가)
+    case 'content_block_delta': {
+      const idx = evt.index;
+      const delta = evt.delta;
+      if (!delta) break;
+
+      const blockInfo = parseState.blocks.get(idx);
+      if (!blockInfo) break;
+
+      if (blockInfo.type === 'text' && delta.type === 'text_delta') {
+        // 텍스트 누적 및 thinking 이벤트 발송
+        const text = delta.text || '';
+        blockInfo.partialText += text;
+        member.thinkingBuffer += text;
+
+        // thinking preview 업데이트 (100자 이내)
+        const preview = member.thinkingBuffer.slice(-100);
+        member.thinkingPreview = preview;
+
+        broadcast('agent:thinking', {
+          runId,
+          name: memberName,
+          text,
+        });
+
+      } else if (blockInfo.type === 'tool_use' && delta.type === 'input_json_delta') {
+        // tool_use input JSON 누적 (partial_json 조각들을 이어붙임)
+        blockInfo.partialJson += delta.partial_json || '';
+      }
+      break;
+    }
+
+    // 블록 종료
+    case 'content_block_stop': {
+      const idx = evt.index;
+      const blockInfo = parseState.blocks.get(idx);
+      if (!blockInfo) break;
+
+      if (blockInfo.type === 'text') {
+        // 텍스트 블록 완료 → thinkingPreview 확정
+        const completed = blockInfo.partialText;
+        if (completed.trim()) {
+          member.thinkingPreview = completed.slice(-100);
+        }
+        member.thinkingBuffer = '';
+
+      } else if (blockInfo.type === 'tool_use') {
+        // tool_use 블록 완료 → 누적된 JSON 파싱 후 메시지 생성
+        let inputObj = {};
+        try {
+          if (blockInfo.partialJson) {
+            inputObj = JSON.parse(blockInfo.partialJson);
+          }
+        } catch {
+          // JSON 파싱 실패 시 빈 객체 유지
+        }
+
+        const toolName = blockInfo.name;
+        const summary = formatToolCall(toolName, inputObj);
+
+        // currentAction 업데이트
+        member.currentAction = summary;
+
+        // toolCalls 기록 (최근 20개 유지)
+        const toolEntry = {
+          tool: toolName,
+          summary,
+          timestamp: new Date().toISOString(),
+        };
+        member.toolCalls.push(toolEntry);
+        if (member.toolCalls.length > 20) {
+          member.toolCalls.shift();
+        }
+
+        // 파일 관련 도구는 fileCount 증가
+        if (toolName === 'Write' || toolName === 'Edit') {
+          member.fileCount++;
+        }
+
+        // turn 카운터 증가
+        member.turn++;
+
+        broadcast('agent:tool_call', {
+          runId,
+          name: memberName,
+          tool: toolName,
+          summary,
+          timestamp: toolEntry.timestamp,
+        });
+        broadcast('agent:status', {
+          runId,
+          name: memberName,
+          status: 'using_tool',
+          turn: member.turn,
+        });
+      }
+
+      // 처리 완료된 블록 정보 삭제
+      parseState.blocks.delete(idx);
+      break;
+    }
+
+    // message_stop: 한 턴 응답 완료
+    case 'message_stop': {
+      // 다음 입력 대기 상태가 될 때까지 thinking 상태 유지
+      // (특별한 처리 불필요 - result 줄이 최종 완료 신호)
+      break;
+    }
+
+    default:
+      // 그 외 이벤트는 무시
+      break;
+  }
+}
+
+// ============================================================
+// JSONL 파일 처리 (증가분만 읽기)
+// ============================================================
+
+/**
+ * stream-json JSONL 파일에서 새로 추가된 줄만 읽어 이벤트 처리
+ * position tracking으로 이미 읽은 부분은 건너뜀
+ * @param {string} filePath - .json 파일 경로
+ */
+async function processJsonlFile(filePath) {
   try {
     // 파일 경로에서 runId와 memberName 추출
     const relativePath = relative(LOGS_DIR, filePath);
@@ -202,20 +498,23 @@ async function processLogFile(filePath) {
     const runId = parts[0];
     const fileName = parts[1];
 
-    // .txt 파일만 처리
-    if (!fileName.endsWith('.txt')) return;
+    // .json 파일만 처리
+    if (!fileName.endsWith('.json')) return;
 
-    const memberName = fileName.replace('.txt', '');
+    const memberName = fileName.replace('.json', '');
     const run = state.runs[runId];
     if (!run) return;
 
+    // 멤버가 없으면 동적으로 추가 (템플릿 미매칭 에이전트 대응)
+    if (!run.members[memberName]) {
+      run.members[memberName] = createMemberState(memberName, '');
+    }
     const member = run.members[memberName];
-    if (!member) return;
 
-    // 파일 전체 내용 읽기
+    // 파일 전체 내용 읽기 (UTF-8 문자열 기준)
     const content = await readFile(filePath, 'utf-8');
 
-    // 현재까지 읽은 문자 수 (UTF-8 문자열 기준)
+    // 현재까지 읽은 문자 수
     const currentPos = filePositions.get(filePath) || 0;
     const newContent = content.slice(currentPos);
 
@@ -224,43 +523,69 @@ async function processLogFile(filePath) {
     // 다음 읽기 위치 업데이트
     filePositions.set(filePath, content.length);
 
-    // 처음 새 내용이 감지되면 실행 중 상태로 변경
-    if (currentPos === 0 && newContent.trim()) {
-      if (member.status === 'waiting') {
-        member.status = 'running';
-        broadcast('agent:status', { runId, name: memberName, status: 'running' });
-      }
+    // 이전 읽기에서 잘린 불완전한 줄 복원
+    const jsonlKey = filePath;
+    if (!jsonlStates.has(jsonlKey)) {
+      jsonlStates.set(jsonlKey, { pendingLine: '' });
     }
+    const jsonlState = jsonlStates.get(jsonlKey);
 
-    // 줄 단위로 분리하여 각 줄을 이벤트로 전송
-    const lines = newContent.split('\n');
-    for (const line of lines) {
+    // 이전 미완성 줄 + 새 내용 합치기
+    const combined = jsonlState.pendingLine + newContent;
+    const lines = combined.split('\n');
+
+    // 마지막 줄이 불완전할 수 있으므로 보류
+    // (개행으로 끝나지 않으면 마지막 줄은 다음 번에 처리)
+    const lastLine = lines[lines.length - 1];
+    jsonlState.pendingLine = combined.endsWith('\n') ? '' : lastLine;
+
+    // 완전한 줄들만 처리 (마지막 줄 제외, 단 개행으로 끝난 경우 포함)
+    const completeLines = combined.endsWith('\n') ? lines.slice(0, -1) : lines.slice(0, -1);
+
+    for (const line of completeLines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
 
-      // 상태에 최근 100줄만 유지
-      member.logs.push(trimmed);
-      if (member.logs.length > 100) {
-        member.logs.shift();
+      // JSON 파싱 시도
+      let parsed;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        // 파싱 실패 줄은 조용히 스킵
+        continue;
       }
 
-      broadcast('agent:log', { runId, name: memberName, line: trimmed });
+      // 처음 내용이 감지되면 waiting → thinking 으로 상태 변경 알림
+      if (member.status === 'waiting') {
+        member.status = 'thinking';
+        member.startTime = new Date().toISOString();
+        broadcast('agent:status', {
+          runId,
+          name: memberName,
+          status: 'thinking',
+          turn: member.turn,
+        });
+      }
+
+      // 스트림 이벤트 처리
+      handleStreamEvent(parsed, runId, memberName);
     }
+
   } catch (err) {
     // 파일이 아직 없거나 읽기 실패 시 무시
     if (err.code !== 'ENOENT') {
-      console.warn(`[경고] 로그 파일 읽기 실패: ${filePath} - ${err.message}`);
+      console.warn(`[경고] JSONL 파일 읽기 실패: ${filePath} - ${err.message}`);
     }
   }
 }
 
 // ============================================================
-// .status 파일 처리
+// .status 파일 처리 (백업 완료 감지)
 // ============================================================
 
 /**
  * .status 파일에서 완료된 팀원 정보 파싱
- * 형식: "memberName 완료" (한 줄씩)
+ * stream-json result 줄이 없을 때의 백업 완료 감지 수단
  * @param {string} filePath - .status 파일 경로
  * @param {string} runId - 실행 ID
  */
@@ -281,14 +606,23 @@ async function processStatusFile(filePath, runId) {
       const member = run.members[memberName];
       if (!member) continue;
 
-      // 이미 완료 처리된 경우 스킵
-      if (member.status === 'done') continue;
+      // 이미 stream-json result로 완료 처리된 경우 스킵
+      if (member.status === 'done' || member.status === 'error') continue;
 
       member.status = 'done';
-      broadcast('agent:status', { runId, name: memberName, status: 'done' });
-      broadcast('agent:done', { runId, name: memberName });
+      broadcast('agent:status', {
+        runId,
+        name: memberName,
+        status: 'done',
+        turn: member.turn,
+      });
+      broadcast('agent:done', {
+        runId,
+        name: memberName,
+        isError: false,
+      });
 
-      console.log(`[정보] 에이전트 완료: ${runId} / ${memberName}`);
+      console.log(`[정보] 에이전트 완료 (.status): ${runId} / ${memberName}`);
     }
   } catch (err) {
     if (err.code !== 'ENOENT') {
@@ -359,16 +693,16 @@ function processWorkspaceFile(filePath, eventType) {
 /**
  * logs/ 디렉토리 감시
  * - 새 실행 디렉토리 감지 (addDir)
- * - .txt 로그 파일 변경 감지 (add, change)
- * - .status 파일 변경 감지 (add, change)
+ * - .json JSONL 파일 변경 감지 (add, change)
+ * - .status 파일 변경 감지 (add, change) - 백업 완료 감지용
  */
 const logsWatcher = chokidar.watch(LOGS_DIR, {
   persistent: true,
   ignoreInitial: false,  // 서버 시작 시 기존 실행도 감지
   depth: 2,
   awaitWriteFinish: {
-    stabilityThreshold: 300,
-    pollInterval: 100,
+    stabilityThreshold: 100,
+    pollInterval: 50,
   },
 });
 
@@ -391,8 +725,12 @@ logsWatcher
     const runId = parts[0];
     const fileName = parts[1];
 
-    if (fileName.endsWith('.txt')) {
-      await processLogFile(filePath);
+    if (fileName.endsWith('.json')) {
+      // runId가 아직 등록되지 않은 경우 초기화 먼저
+      if (!state.runs[runId]) {
+        await initRun(join(LOGS_DIR, runId));
+      }
+      await processJsonlFile(filePath);
     } else if (fileName === '.status') {
       // runId가 아직 등록되지 않은 경우 초기화 먼저
       if (!state.runs[runId]) {
@@ -409,8 +747,8 @@ logsWatcher
     const runId = parts[0];
     const fileName = parts[1];
 
-    if (fileName.endsWith('.txt')) {
-      await processLogFile(filePath);
+    if (fileName.endsWith('.json')) {
+      await processJsonlFile(filePath);
     } else if (fileName === '.status') {
       await processStatusFile(filePath, runId);
     }

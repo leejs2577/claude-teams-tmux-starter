@@ -151,7 +151,7 @@ workspace/shared/ 에서 팀 리더의 지시 파일이 있다면 먼저 읽고 
             --append-system-prompt "$SYSTEM_PROMPT" \
             --max-turns "$MAX_TURNS" \
             --max-budget-usd "$MAX_BUDGET_USD" \
-            --output-format json \
+            --output-format stream-json \
             --allowedTools "Read,Write,Edit,Bash" \
             2>"$LOG_TEXT" | tee "$LOG_FILE" > /dev/null
         echo "$MEMBER_NAME 완료" >> "$LOG_DIR/.status"
@@ -209,8 +209,8 @@ for i in $(seq 0 $((MEMBER_TOTAL - 1))); do
     DONE_FILE="$PROJECT_DIR/workspace/${MEMBER_NAME}/DONE.md"
 
     if [ -f "$LOG_FILE" ]; then
-        # JSON에서 오류 여부 확인
-        HAS_ERROR=$(jq -r '.is_error // false' "$LOG_FILE" 2>/dev/null)
+        # stream-json 포맷: 마지막 줄이 최종 result 객체
+        HAS_ERROR=$(tail -1 "$LOG_FILE" 2>/dev/null | jq -r '.is_error // false' 2>/dev/null)
         if [ "$HAS_ERROR" = "true" ]; then
             echo -e "  ${RED}✗${NC} $MEMBER_DISPLAY - 오류 발생 (로그: ${MEMBER_NAME}.json)"
         else
