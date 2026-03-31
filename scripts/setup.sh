@@ -6,6 +6,9 @@
 
 set -e
 
+# Homebrew PATH 추가 (Apple Silicon)
+export PATH="/opt/homebrew/bin:$PATH"
+
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'

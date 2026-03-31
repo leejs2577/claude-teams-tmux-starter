@@ -9,6 +9,9 @@
 #   ./scripts/team-stop.sh --all           # 모든 claude-team 세션 종료
 # ============================================================
 
+# Homebrew PATH 추가 (Apple Silicon)
+export PATH="/opt/homebrew/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 

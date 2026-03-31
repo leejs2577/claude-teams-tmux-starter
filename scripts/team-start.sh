@@ -12,6 +12,9 @@
 
 set -e
 
+# Homebrew PATH 추가 (Apple Silicon)
+export PATH="/opt/homebrew/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 TEMPLATE=${1:-"web-dev"}

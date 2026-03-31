@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Code Teams Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<!-- ============================================================
+     헤더
+     ============================================================ -->
+<header class="header">
+  <div class="header-brand">
+    <div class="logo">T</div>
+    <h1>Teams Dashboard</h1>
+  </div>
+
+  <div class="header-divider"></div>
+
+  <div class="header-run-info">
+    <span class="run-badge" id="runBadge">
+      <span class="dot"></span>
+      <span id="runBadgeText">대기 중</span>
+    </span>
+    <span class="run-timestamp" id="runTimestamp"></span>
+  </div>
+
+  <div class="header-progress" id="headerProgress" style="display:none">
+    <span class="progress-label" id="progressLabel">0 / 0</span>
+    <div class="progress-track">
+      <div class="progress-fill" id="progressFill" style="width:0%"></div>
+    </div>
+  </div>
+
+  <div class="connection-status" id="connectionStatus">
+    <span class="dot"></span>
+    <span id="connectionText">연결 중...</span>
+  </div>
+</header>
+
+<!-- ============================================================
+     본문
+     ============================================================ -->
+<div class="app-body">
+
+  <!-- 에이전트 패널 (왼쪽 70%) -->
+  <main class="agents-panel" id="agentsPanel">
+    <!-- 에이전트 없을 때 표시되는 대기 화면 -->
+    <div class="empty-state" id="emptyState">
+      <div class="icon">&#9881;</div>
+      <h2>team-run.sh 실행 대기 중...</h2>
+      <p>
+        아래 명령어로 팀을 실행하면<br/>
+        에이전트 카드가 실시간으로 나타납니다.
+      </p>
+      <code>./scripts/team-run.sh web-dev "작업 설명"</code>
+    </div>
+
+    <!-- 실행 세션들이 여기에 동적으로 추가됨 -->
+    <div id="runsContainer"></div>
+  </main>
+
+  <!-- 사이드바: 파일 활동 피드 (오른쪽 30%) -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <span class="sidebar-title">파일 활동</span>
+      <span class="sidebar-count" id="fileCount">0</span>
+    </div>
+    <div class="sidebar-body" id="fileFeed">
+      <div class="feed-empty">파일 활동이 없습니다</div>
+    </div>
+  </aside>
+
+</div>
+
+<!-- 토스트 알림 컨테이너 -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- ============================================================
+     JavaScript
+     ============================================================ -->
+<script>
+'use strict';
+
+// ============================================================
+// 상태 관리
+// ============================================================
+
+/**
+ * 클라이언트 측 전체 상태
+ * runs: 실행 중인 팀 세션들
+ * recentFiles: 최근 파일 활동 목록
+ */
+let appState = {
+  runs: {},
+  recentFiles: [],
+};
+
+// 현재 표시 중인 가장 최근 runId
+let activeRunId = null;
+
+// SSE 연결 객체
+let eventSource = null;
+
+// 재연결 타이머
+let reconnectTimer = null;
+
+// 로그 자동 스크롤 추적: cardId -> boolean (true면 자동 스크롤 활성)
+const autoScrollMap = new Map();
+
+// ============================================================
+// 유틸리티
+// ============================================================
+
+/**
+ * 타임스탬프 문자열(YYYYMMDD-HHMMSS)을 읽기 좋은 형식으로 변환
+ * @param {string} ts - 타임스탬프 문자열
+ * @returns {string}
+ */
+function formatTimestamp(ts) {
+  if (!ts) return '';
+  const m = ts.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/);
+  if (!m) return ts;
+  return `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`;
+}
+
+/**
+ * ISO 시간 문자열을 HH:MM:SS 형식으로 변환
+ * @param {string} isoString - ISO 8601 형식 시간 문자열
+ * @returns {string}
+ */
+function formatTime(isoString) {
+  const d = new Date(isoString);
+  return d.toLocaleTimeString('ko-KR', { hour12: false });
+}
+
+/**
+ * HTML 특수문자 이스케이프 (XSS 방지)
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * 가장 최근 runId 반환 (타임스탬프 기준 정렬)
+ * @returns {string|null}
+ */
+function getLatestRunId() {
+  const ids = Object.keys(appState.runs);
+  if (ids.length === 0) return null;
+  return ids.sort().pop();
+}
+
+/**
+ * 에이전트 상태의 한국어 레이블 반환
+ * @param {string} status
+ * @returns {string}
+ */
+function statusLabel(status) {
+  const labels = {
+    waiting: '대기중',
+    running: '실행중',
+    done:    '완료',
+    error:   '오류',
+  };
+  return labels[status] || status;
+}
+
+// ============================================================
+// DOM 요소 참조
+// ============================================================
+const $emptyState     = document.getElementById('emptyState');
+const $runsContainer  = document.getElementById('runsContainer');
+const $fileFeed       = document.getElementById('fileFeed');
+const $fileCount      = document.getElementById('fileCount');
+const $runBadge       = document.getElementById('runBadge');
+const $runBadgeText   = document.getElementById('runBadgeText');
+const $runTimestamp   = document.getElementById('runTimestamp');
+const $headerProgress = document.getElementById('headerProgress');
+const $progressLabel  = document.getElementById('progressLabel');
+const $progressFill   = document.getElementById('progressFill');
+const $connectionStatus = document.getElementById('connectionStatus');
+const $connectionText = document.getElementById('connectionText');
+const $toastContainer = document.getElementById('toastContainer');
+
+// ============================================================
+// 헤더 업데이트
+// ============================================================
+
+/**
+ * 헤더의 실행 정보 및 진행률 업데이트
+ */
+function updateHeader() {
+  const runId = getLatestRunId();
+
+  if (!runId) {
+    // 실행 없음
+    $runBadge.className = 'run-badge';
+    $runBadgeText.textContent = '대기 중';
+    $runTimestamp.textContent = '';
+    $headerProgress.style.display = 'none';
+    return;
+  }
+
+  const run = appState.runs[runId];
+  const members = run.members;
+  const names = Object.keys(members);
+  const doneCount = names.filter(n => members[n].status === 'done').length;
+  const runningCount = names.filter(n => members[n].status === 'running').length;
+
+  // 배지 상태 업데이트
+  const isActive = doneCount < names.length;
+  $runBadge.className = `run-badge${isActive ? ' active' : ''}`;
+  $runBadgeText.textContent = run.displayName || run.template;
+
+  // 타임스탬프
+  $runTimestamp.textContent = formatTimestamp(run.timestamp);
+
+  // 진행률
+  $headerProgress.style.display = 'flex';
+  const pct = names.length > 0 ? Math.round((doneCount / names.length) * 100) : 0;
+  $progressLabel.textContent = `${doneCount} / ${names.length} 완료`;
+  $progressFill.style.width = `${pct}%`;
+}
+
+// ============================================================
+// 에이전트 카드 렌더링
+// ============================================================
+
+/**
+ * 새 실행 섹션 DOM 생성
+ * @param {string} runId
+ * @param {object} run - 실행 데이터
+ */
+function createRunSection(runId, run) {
+  // 대기 화면 숨기기
+  $emptyState.style.display = 'none';
+
+  // 섹션 컨테이너
+  const section = document.createElement('div');
+  section.className = 'run-section';
+  section.id = `run-${runId}`;
+
+  // 섹션 헤더
+  const header = document.createElement('div');
+  header.className = 'run-section-header';
+  header.innerHTML = `
+    <span class="run-section-title">${escapeHtml(run.displayName || run.template)}</span>
+    <span class="run-section-meta">${escapeHtml(formatTimestamp(run.timestamp))}</span>
+  `;
+  section.appendChild(header);
+
+  // 카드 그리드
+  const grid = document.createElement('div');
+  grid.className = 'agents-grid';
+  grid.id = `grid-${runId}`;
+  section.appendChild(grid);
+
+  // 각 멤버 카드 생성
+  for (const [name, member] of Object.entries(run.members)) {
+    const card = createAgentCard(runId, name, member);
+    grid.appendChild(card);
+  }
+
+  // 최신 실행을 맨 위에 추가
+  $runsContainer.prepend(section);
+
+  updateHeader();
+}
+
+/**
+ * 에이전트 카드 DOM 생성
+ * @param {string} runId
+ * @param {string} name - 에이전트 이름
+ * @param {object} member - 멤버 데이터
+ * @returns {HTMLElement}
+ */
+function createAgentCard(runId, name, member) {
+  const cardId = `card-${runId}-${name}`;
+  const card = document.createElement('div');
+  card.className = 'agent-card';
+  card.id = cardId;
+  card.dataset.status = member.status;
+  card.dataset.name = name;
+  card.dataset.runId = runId;
+
+  card.innerHTML = `
+    <div class="card-header">
+      <span class="status-badge ${member.status}" id="badge-${cardId}">
+        <span class="badge-dot"></span>
+        <span class="badge-label">${statusLabel(member.status)}</span>
+      </span>
+      <div class="card-identity">
+        <div class="card-name">${escapeHtml(member.displayName || name)}</div>
+        <div class="card-role">${escapeHtml(member.role || '')}</div>
+      </div>
+      <div class="file-count" id="filecount-${cardId}">
+        <span>파일</span>
+        <span class="count-num">${member.fileCount || 0}</span>
+      </div>
+    </div>
+    <div class="card-logs" id="logs-${cardId}">
+      <span class="log-empty">로그 대기 중...</span>
+    </div>
+  `;
+
+  // 로그 영역 스크롤 이벤트: 사용자가 위로 스크롤하면 자동 스크롤 멈춤
+  const logsEl = card.querySelector(`#logs-${cardId}`);
+  autoScrollMap.set(cardId, true);
+
+  logsEl.addEventListener('scroll', () => {
+    const isAtBottom = logsEl.scrollHeight - logsEl.scrollTop <= logsEl.clientHeight + 30;
+    autoScrollMap.set(cardId, isAtBottom);
+  });
+
+  // 기존 로그 출력
+  if (member.logs && member.logs.length > 0) {
+    renderLogs(cardId, member.logs, false);
+  }
+
+  return card;
+}
+
+/**
+ * 로그 영역에 로그 줄들을 렌더링
+ * @param {string} cardId
+ * @param {string[]} lines - 렌더링할 로그 줄들
+ * @param {boolean} isNew - 새로 추가된 줄인지 여부 (flash 효과용)
+ */
+function renderLogs(cardId, lines, isNew = false) {
+  const logsEl = document.getElementById(`logs-${cardId}`);
+  if (!logsEl) return;
+
+  // 처음 로그가 들어오면 빈 메시지 제거
+  const emptyEl = logsEl.querySelector('.log-empty');
+  if (emptyEl) emptyEl.remove();
+
+  // 최근 50줄만 DOM에 유지 (성능 최적화)
+  const existingLines = logsEl.querySelectorAll('.log-line');
+  const MAX_DOM_LINES = 50;
+  const removeCount = Math.max(0, existingLines.length + lines.length - MAX_DOM_LINES);
+  for (let i = 0; i < removeCount; i++) {
+    existingLines[i]?.remove();
+  }
+
+  // 새 줄 추가
+  const fragment = document.createDocumentFragment();
+  for (const line of lines) {
+    const span = document.createElement('span');
+    span.className = `log-line${isNew ? ' new' : ''}`;
+
+    // 에러/경고 키워드 감지로 색상 구분
+    const lower = line.toLowerCase();
+    if (lower.includes('error') || lower.includes('오류') || lower.includes('failed')) {
+      span.classList.add('is-error');
+    } else if (lower.includes('warn') || lower.includes('warning') || lower.includes('경고')) {
+      span.classList.add('is-warn');
+    }
+
+    span.textContent = line;
+    fragment.appendChild(span);
+    fragment.appendChild(document.createTextNode('\n'));
+  }
+  logsEl.appendChild(fragment);
+
+  // 자동 스크롤
+  if (autoScrollMap.get(cardId) !== false) {
+    logsEl.scrollTop = logsEl.scrollHeight;
+  }
+}
+
+/**
+ * 에이전트 카드의 상태 업데이트
+ * @param {string} runId
+ * @param {string} name
+ * @param {string} status
+ */
+function updateCardStatus(runId, name, status) {
+  const cardId = `card-${runId}-${name}`;
+  const card = document.getElementById(cardId);
+  if (!card) return;
+
+  // 카드 data-status 업데이트 (CSS 상단 테두리 변경)
+  card.dataset.status = status;
+
+  // 배지 업데이트
+  const badge = document.getElementById(`badge-${cardId}`);
+  if (badge) {
+    badge.className = `status-badge ${status}`;
+    const labelEl = badge.querySelector('.badge-label');
+    if (labelEl) labelEl.textContent = statusLabel(status);
+  }
+
+  // 완료 배너 추가
+  if (status === 'done') {
+    const logsEl = document.getElementById(`logs-${cardId}`);
+    if (logsEl && !card.querySelector('.card-done-banner')) {
+      const banner = document.createElement('div');
+      banner.className = 'card-done-banner';
+      banner.innerHTML = `
+        <span>&#10003;</span>
+        <span>작업 완료</span>
+      `;
+      card.appendChild(banner);
+    }
+  }
+}
+
+/**
+ * 파일 카운터 업데이트
+ * @param {string} runId
+ * @param {string} name
+ * @param {number} count
+ */
+function updateFileCount(runId, name, count) {
+  const cardId = `card-${runId}-${name}`;
+  const el = document.getElementById(`filecount-${cardId}`);
+  if (!el) return;
+  const numEl = el.querySelector('.count-num');
+  if (numEl) numEl.textContent = count;
+}
+
+// ============================================================
+// 파일 피드 렌더링
+// ============================================================
+
+/**
+ * 파일 활동 피드에 항목 추가
+ * @param {object} fileEntry - { path, type, time, memberName }
+ * @param {boolean} prepend - 맨 위에 추가할지 여부
+ */
+function addFileToFeed(fileEntry, prepend = true) {
+  // 빈 상태 메시지 제거
+  const emptyEl = $fileFeed.querySelector('.feed-empty');
+  if (emptyEl) emptyEl.remove();
+
+  const item = document.createElement('div');
+  item.className = `file-item member-${escapeHtml(fileEntry.memberName || 'shared')}`;
+
+  const typeLabel = fileEntry.type === 'add' ? 'NEW' : 'MOD';
+  const timeStr = fileEntry.time ? formatTime(fileEntry.time) : '';
+
+  item.innerHTML = `
+    <div class="file-type-icon ${escapeHtml(fileEntry.type)}">${typeLabel}</div>
+    <div class="file-info">
+      <span class="file-path" title="${escapeHtml(fileEntry.path)}">${escapeHtml(fileEntry.path)}</span>
+      <div class="file-meta">
+        <span class="file-member">${escapeHtml(fileEntry.memberName || 'shared')}</span>
+        <span class="file-time">${escapeHtml(timeStr)}</span>
+      </div>
+    </div>
+  `;
+
+  if (prepend) {
+    $fileFeed.prepend(item);
+  } else {
+    $fileFeed.appendChild(item);
+  }
+
+  // 최대 30개 유지
+  const items = $fileFeed.querySelectorAll('.file-item');
+  if (items.length > 30) {
+    items[items.length - 1].remove();
+  }
+
+  // 카운터 업데이트
+  $fileCount.textContent = $fileFeed.querySelectorAll('.file-item').length;
+}
+
+// ============================================================
+// 토스트 알림
+// ============================================================
+
+/**
+ * 토스트 알림 표시
+ * @param {string} message - 알림 메시지
+ * @param {string} type - 알림 타입 ('done' | 'error' | 'info')
+ * @param {number} duration - 표시 시간 (ms)
+ */
+function showToast(message, type = 'info', duration = 4000) {
+  const icons = { done: '&#10003;', error: '&#10007;', info: 'i' };
+
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.innerHTML = `
+    <span class="toast-icon">${icons[type] || 'i'}</span>
+    <span>${escapeHtml(message)}</span>
+  `;
+
+  $toastContainer.appendChild(toast);
+
+  setTimeout(() => {
+    toast.classList.add('fade-out');
+    setTimeout(() => toast.remove(), 300);
+  }, duration);
+}
+
+// ============================================================
+// 전체 상태에서 UI 초기화
+// ============================================================
+
+/**
+ * 서버로부터 받은 전체 상태로 UI를 초기화
+ * @param {object} serverState - 서버 상태 스냅샷
+ */
+function initializeFromState(serverState) {
+  appState = serverState;
+
+  // 실행 섹션 생성 (시간 순 정렬, 오래된 것 먼저)
+  const runIds = Object.keys(appState.runs).sort();
+
+  if (runIds.length === 0) {
+    $emptyState.style.display = 'flex';
+  } else {
+    $emptyState.style.display = 'none';
+    for (const runId of runIds) {
+      if (!document.getElementById(`run-${runId}`)) {
+        createRunSection(runId, appState.runs[runId]);
+      }
+    }
+    activeRunId = getLatestRunId();
+  }
+
+  // 파일 피드 초기화 (최신 순으로 표시)
+  if (appState.recentFiles && appState.recentFiles.length > 0) {
+    $fileFeed.innerHTML = '';
+    // recentFiles는 이미 최신 순이므로 append
+    for (const fileEntry of appState.recentFiles) {
+      addFileToFeed(fileEntry, false);
+    }
+  }
+
+  updateHeader();
+}
+
+// ============================================================
+// SSE 이벤트 처리
+// ============================================================
+
+/**
+ * 각 SSE 이벤트 타입별 처리 함수 매핑
+ */
+const eventHandlers = {
+
+  /**
+   * 전체 상태 스냅샷 (연결 직후 수신)
+   */
+  'state': (data) => {
+    initializeFromState(data);
+  },
+
+  /**
+   * 새 실행 세션 시작
+   */
+  'run:start': (data) => {
+    const { runId, template, displayName, timestamp, members } = data;
+
+    // 상태에 등록
+    appState.runs[runId] = { template, displayName, timestamp, members };
+    activeRunId = runId;
+
+    // DOM 생성
+    createRunSection(runId, appState.runs[runId]);
+    updateHeader();
+
+    showToast(`새 실행 시작: ${displayName || template}`, 'info');
+  },
+
+  /**
+   * 에이전트 상태 변경
+   */
+  'agent:status': (data) => {
+    const { runId, name, status } = data;
+    const run = appState.runs[runId];
+    if (run?.members[name]) {
+      run.members[name].status = status;
+    }
+    updateCardStatus(runId, name, status);
+    updateHeader();
+  },
+
+  /**
+   * 에이전트 로그 줄 추가
+   */
+  'agent:log': (data) => {
+    const { runId, name, line } = data;
+    const cardId = `card-${runId}-${name}`;
+
+    // 상태 로그 배열 업데이트
+    const run = appState.runs[runId];
+    if (run?.members[name]) {
+      const logs = run.members[name].logs;
+      logs.push(line);
+      if (logs.length > 100) logs.shift();
+    }
+
+    // DOM 업데이트
+    renderLogs(cardId, [line], true);
+  },
+
+  /**
+   * 에이전트 완료
+   */
+  'agent:done': (data) => {
+    const { runId, name } = data;
+    const run = appState.runs[runId];
+    const member = run?.members[name];
+
+    if (member) {
+      const displayName = member.displayName || name;
+      showToast(`${displayName} 완료`, 'done');
+    }
+
+    updateHeader();
+  },
+
+  /**
+   * 파일 생성/변경 이벤트
+   */
+  'file:change': (data) => {
+    const { runId, memberName, path, type } = data;
+
+    // 파일 카운터 업데이트
+    const run = appState.runs[runId];
+    if (run?.members[memberName]) {
+      run.members[memberName].fileCount++;
+      updateFileCount(runId, memberName, run.members[memberName].fileCount);
+    }
+
+    // 피드에 추가
+    const fileEntry = {
+      path,
+      type,
+      time: new Date().toISOString(),
+      memberName,
+    };
+    appState.recentFiles.unshift(fileEntry);
+    if (appState.recentFiles.length > 30) appState.recentFiles.pop();
+
+    addFileToFeed(fileEntry, true);
+  },
+};
+
+// ============================================================
+// SSE 연결 관리
+// ============================================================
+
+/**
+ * SSE 연결 상태 표시 업데이트
+ * @param {'connecting'|'connected'|'reconnecting'} status
+ */
+function setConnectionStatus(status) {
+  $connectionStatus.className = `connection-status ${status === 'connected' ? 'connected' : status === 'reconnecting' ? 'reconnecting' : ''}`;
+  const labels = {
+    connecting:   '연결 중...',
+    connected:    '연결됨',
+    reconnecting: '재연결 중...',
+  };
+  $connectionText.textContent = labels[status] || status;
+}
+
+/**
+ * SSE 연결 시작
+ */
+function connectSSE() {
+  // 기존 연결 정리
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+
+  setConnectionStatus('connecting');
+  eventSource = new EventSource('/events');
+
+  // 연결 성공
+  eventSource.addEventListener('open', () => {
+    setConnectionStatus('connected');
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    console.log('[대시보드] SSE 연결 성공');
+  });
+
+  // 각 이벤트 타입에 대한 리스너 등록
+  for (const [eventType, handler] of Object.entries(eventHandlers)) {
+    eventSource.addEventListener(eventType, (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        handler(data);
+      } catch (err) {
+        console.error(`[대시보드] 이벤트 처리 오류 (${eventType}):`, err);
+      }
+    });
+  }
+
+  // 연결 오류 시 자동 재연결
+  eventSource.addEventListener('error', (e) => {
+    console.warn('[대시보드] SSE 연결 오류, 3초 후 재연결...');
+    setConnectionStatus('reconnecting');
+    eventSource.close();
+    eventSource = null;
+
+    if (!reconnectTimer) {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectSSE();
+      }, 3000);
+    }
+  });
+}
+
+// ============================================================
+// 초기화
+// ============================================================
+
+/**
+ * 앱 초기화: SSE 연결 시작
+ */
+function init() {
+  console.log('[대시보드] 초기화 시작');
+  connectSSE();
+}
+
+// DOM 로드 완료 후 초기화
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}
+</script>
+</body>
+</html>
